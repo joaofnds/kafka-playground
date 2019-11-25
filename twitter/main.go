@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/Shopify/sarama"
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
+	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
 )
 
 const (
@@ -25,9 +25,9 @@ var (
 	api *twitter.Client
 
 	//  kafka
-	brokerList = []string{"localhost:9092"}
-	topic      = "test-topic"
-	maxRetry   = 2
+	broker   = "localhost:9092"
+	topic    = "tweets"
+	maxRetry = 2
 )
 
 func init() {
@@ -35,24 +35,23 @@ func init() {
 	token := oauth1.NewToken(twitterToken, twitterTokenSecret)
 	httpClient := twitterConfig.Client(oauth1.NoContext, token)
 	api = twitter.NewClient(httpClient)
-
 }
 
 func main() {
-	producer, err := initSarama()
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": broker})
 	exitOnError(err)
-	defer func() { exitOnError(producer.Close()) }()
 
 	params := &twitter.StreamFilterParams{
-		Track:         []string{"linux"},
+		Track:         []string{"cybertruck"},
 		StallWarnings: twitter.Bool(true),
 	}
 	stream, err := api.Streams.Filter(params)
 	exitOnError(err)
 	defer stream.Stop()
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	sigChan := make(chan os.Signal, 1)
+	defer close(sigChan)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	fmt.Println("Listening to tweets. Quit with Ctrl-C")
 
 loop:
@@ -62,9 +61,9 @@ loop:
 			if tweet, ok := event.(*twitter.Tweet); ok {
 				b, err := json.Marshal(tweet)
 				exitOnError(err)
-				publishMessage(producer, topic, b)
+				exitOnError(publishMessage(producer, topic, b))
 			}
-		case <-signalChan:
+		case <-sigChan:
 			fmt.Println("\b\bsignal received, exiting...")
 			break loop
 		}
@@ -77,25 +76,29 @@ func exitOnError(err error) {
 	}
 }
 
-func initSarama() (sarama.SyncProducer, error) {
-	kafkaConfig := sarama.NewConfig()
-	kafkaConfig.Producer.RequiredAcks = sarama.WaitForAll
-	kafkaConfig.Producer.Retry.Max = 2
-	kafkaConfig.Producer.Return.Successes = true
+func publishMessage(producer *kafka.Producer, topic string, msg []byte) error {
+	deliveryChan := make(chan kafka.Event)
+	defer close(deliveryChan)
 
-	return sarama.NewSyncProducer(brokerList, kafkaConfig)
-}
+	err := producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     &topic,
+			Partition: kafka.PartitionAny,
+		},
+		Value: msg,
+	}, deliveryChan)
 
-func publishMessage(producer sarama.SyncProducer, topic string, msg []byte) error {
-	kafkaMessage := &sarama.ProducerMessage{
-		Topic: topic,
-		Value: sarama.ByteEncoder(msg),
-	}
-
-	partition, offset, err := producer.SendMessage(kafkaMessage)
 	if err != nil {
-		fmt.Printf("Message is stored in topic(%s)/partition(%d)/offset(%d)\n", topic, partition, offset)
+		return err
 	}
 
-	return err
+	e := <-deliveryChan
+	m := e.(*kafka.Message)
+
+	if m.TopicPartition.Error != nil {
+		return fmt.Errorf("Delivery failed: %v", m.TopicPartition.Error)
+	}
+
+	fmt.Printf("Delivered message to topic %s [%d] at offset %v\n", *m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset)
+	return nil
 }
