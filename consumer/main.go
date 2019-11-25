@@ -2,55 +2,64 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"syscall"
 
-	"github.com/Shopify/sarama"
-)
-
-var (
-	brokerList        = []string{"localhost:9092"}
-	topic             = "test-topic"
-	partition         = int32(0)
-	messageCountStart = 0
+	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
 )
 
 func main() {
-	config := sarama.NewConfig()
-	config.Consumer.Return.Errors = true
-	master, err := sarama.NewConsumer(brokerList, config)
-	if err != nil {
-		panic(err)
-	}
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers":               "localhost:9092",
+		"group.id":                        1,
+		"session.timeout.ms":              6000,
+		"go.events.channel.enable":        true,
+		"go.application.rebalance.enable": true,
+		// Enable generation of PartitionEOF when the
+		// end of a partition is reached.
+		"enable.partition.eof": true,
+		"auto.offset.reset":    "earliest"})
 
-	defer func() {
-		if err := master.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	exitOnError(err)
+	defer consumer.Close()
 
-	consumer, err := master.ConsumePartition(topic, 0, sarama.OffsetNewest)
-	if err != nil {
-		panic(err)
-	}
+	err = consumer.SubscribeTopics([]string{"tweets"}, nil)
+	exitOnError(err)
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
-	doneCh := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case err := <-consumer.Errors():
-				fmt.Println(err)
-			case msg := <-consumer.Messages():
-				messageCountStart++
-				fmt.Println("Received messages", string(msg.Key), string(msg.Value))
-			case <-signals:
-				fmt.Println("Interrupt received, shutting down...")
-				doneCh <- struct{}{}
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+
+loop:
+	for {
+		select {
+		case sig := <-sigchan:
+			fmt.Printf("Caught signal %v: terminating\n", sig)
+			break loop
+
+		case ev := <-consumer.Events():
+			switch e := ev.(type) {
+			case kafka.AssignedPartitions:
+				fmt.Fprintf(os.Stderr, "%% %v\n", e)
+				consumer.Assign(e.Partitions)
+			case kafka.RevokedPartitions:
+				fmt.Fprintf(os.Stderr, "%% %v\n", e)
+				consumer.Unassign()
+			case *kafka.Message:
+				fmt.Printf("%% Message on %s:\n%s\n", e.TopicPartition, string(e.Value))
+			case kafka.PartitionEOF:
+				fmt.Printf("%% Reached %v\n", e)
+			case kafka.Error:
+				// Errors should generally be considered as informational, the client will try to automatically recover
+				fmt.Fprintf(os.Stderr, "%% Error: %v\n", e)
 			}
 		}
-	}()
-	<-doneCh
-	fmt.Println("Processed", messageCountStart, "message")
+	}
+}
+
+func exitOnError(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }

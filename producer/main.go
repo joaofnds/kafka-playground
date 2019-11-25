@@ -2,39 +2,43 @@ package main
 
 import (
 	"fmt"
-
-	"github.com/Shopify/sarama"
-)
-
-var (
-	brokerList = []string{"localhost:2181"}
-	topic      = "test-topic"
-	maxRetry   = 2
+	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
+	"os"
 )
 
 func main() {
-	config := sarama.NewConfig()
-	config.Producer.RequiredAcks = sarama.WaitForAll
-	config.Producer.Retry.Max = 2
-	config.Producer.Return.Successes = true
-	producer, err := sarama.NewSyncProducer(brokerList, config)
+	broker := "localhost:9092"
+	topic := "tweets"
+
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": broker})
+
 	if err != nil {
-		panic(err)
+		fmt.Printf("Failed to create producer: %s\n", err)
+		os.Exit(1)
 	}
 
-	defer func() {
-		if err := producer.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	fmt.Printf("Created Producer %v\n", p)
 
-	msg := &sarama.ProducerMessage{
-		Topic: topic,
-		Value: sarama.StringEncoder("message"),
+	// Optional delivery channel, if not specified the Producer object's
+	// .Events channel is used.
+	deliveryChan := make(chan kafka.Event)
+
+	value := "Hello Go!"
+	err = p.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Value:          []byte(value),
+		Headers:        []kafka.Header{{Key: "myTestHeader", Value: []byte("header values are binary")}},
+	}, deliveryChan)
+
+	e := <-deliveryChan
+	m := e.(*kafka.Message)
+
+	if m.TopicPartition.Error != nil {
+		fmt.Printf("Delivery failed: %v\n", m.TopicPartition.Error)
+	} else {
+		fmt.Printf("Delivered message to topic %s [%d] at offset %v\n",
+			*m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset)
 	}
-	partition, offset, err := producer.SendMessage(msg)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("Message is stored in topic(%s)/partition(%d)/offset(%d)\n", topic, partition, offset)
+
+	close(deliveryChan)
 }
